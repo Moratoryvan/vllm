@@ -165,6 +165,9 @@ from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.spec_decode.adaptive_draft_router import (
+    AdaptiveDraftRouterProposer,
+)
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -522,6 +525,7 @@ class GPUModelRunner(
                 | EagleProposer
                 | DFlashProposer
                 | DraftModelProposer
+                | AdaptiveDraftRouterProposer
                 | MedusaProposer
                 | ExtractHiddenStatesProposer
             )
@@ -529,6 +533,12 @@ class GPUModelRunner(
                 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
                 self.drafter = NgramProposer(self.vllm_config)
+            elif self.speculative_config.uses_adaptive_draft_router():
+                self.drafter = AdaptiveDraftRouterProposer(
+                    vllm_config=self.vllm_config,
+                    device=self.device,
+                    runner=self,
+                )
             elif self.speculative_config.uses_draft_model():
                 self.drafter = DraftModelProposer(
                     vllm_config=self.vllm_config,
@@ -4611,6 +4621,22 @@ class GPUModelRunner(
             )
             self._copy_valid_sampled_token_count(
                 next_token_ids, valid_sampled_tokens_count
+            )
+
+        elif spec_config.uses_adaptive_draft_router():
+            assert isinstance(self.drafter, AdaptiveDraftRouterProposer)
+            draft_token_ids = self.drafter.propose(
+                requests=self.requests,
+                input_batch=self.input_batch,
+                scheduler_output=scheduler_output,
+                sampled_token_ids=sampled_token_ids,
+                sampling_metadata=sampling_metadata,
+                hidden_states=hidden_states,
+                sample_hidden_states=sample_hidden_states,
+                aux_hidden_states=aux_hidden_states,
+                spec_decode_metadata=spec_decode_metadata,
+                common_attn_metadata=common_attn_metadata,
+                slot_mappings=slot_mappings,
             )
 
         elif (

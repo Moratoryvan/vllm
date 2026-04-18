@@ -58,6 +58,7 @@ SpeculativeMethod = Literal[
     "medusa",
     "mlp_speculator",
     "draft_model",
+    "adaptive_draft_router",
     "suffix",
     EagleModelTypes,
     NgramGPUTypes,
@@ -144,6 +145,33 @@ class SpeculativeConfig:
     in parallel rather than sequentially. This can improve performance but
     requires the speculative model be trained to support parallel drafting.
     Only compatible with EAGLE and draft model methods."""
+
+    models: list[dict[str, Any]] | None = None
+    """Draft-model specs for routed speculative decoding.
+
+    Only used when ``method="adaptive_draft_router"``. Each entry is expected
+    to contain at least ``{"id": ..., "model": ...}``, and may additionally
+    provide fields such as ``max_k`` and per-model overrides that a custom
+    proposer can interpret.
+    """
+    adaptive_draft_strategy: Literal[
+        "single_model", "token_cascade", "logit_average"
+    ] = "single_model"
+    """Aggregation strategy used by ``adaptive_draft_router``.
+
+    ``single_model`` matches the current intended design, where each request
+    uses at most one draft model. ``token_cascade`` and ``logit_average`` are
+    scaffolds for future experimentation.
+    """
+    default_model_id: str | None = None
+    """Default routed draft-model identifier for ``adaptive_draft_router``.
+
+    If unset, the first entry in ``models`` is used as the implicit fallback.
+    """
+    request_model_extra_arg_key: str = "spec_model"
+    """SamplingParams.extra_args key used to select a routed draft model."""
+    request_k_extra_arg_key: str = "spec_k"
+    """SamplingParams.extra_args key used to override per-request draft length."""
 
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -377,7 +405,9 @@ class SpeculativeConfig:
 
         # infer method from user args
         if self.method is None:
-            if self.model in ("ngram", "[ngram]"):
+            if self.models:
+                self.method = "adaptive_draft_router"
+            elif self.model in ("ngram", "[ngram]"):
                 self.method = "ngram"
             else:
                 self.method = "draft_model"
@@ -410,6 +440,8 @@ class SpeculativeConfig:
                 self.model = "suffix"
             elif self.method == "extract_hidden_states":
                 self.model = "extract_hidden_states"
+            elif self.method == "adaptive_draft_router":
+                self.model = "adaptive_draft_router"
             else:
                 raise ValueError(
                     "num_speculative_tokens was provided but without speculative model."
@@ -453,6 +485,38 @@ class SpeculativeConfig:
             self.draft_parallel_config = self.target_parallel_config
         elif self.method == "suffix":
             self._validate_suffix_decoding()
+        elif self.method == "adaptive_draft_router":
+            if not self.models:
+                raise ValueError(
+                    "adaptive_draft_router requires a non-empty `models` list in "
+                    "speculative_config."
+                )
+            model_ids = [model.get("id") for model in self.models]
+            if any(not model_id for model_id in model_ids):
+                raise ValueError(
+                    "Each adaptive_draft_router model entry must define a non-empty "
+                    "`id` field."
+                )
+            if len(set(model_ids)) != len(model_ids):
+                raise ValueError(
+                    "adaptive_draft_router model ids must be unique. "
+                    f"Got {model_ids!r}."
+                )
+            if self.default_model_id is None:
+                self.default_model_id = str(model_ids[0])
+            elif self.default_model_id not in set(model_ids):
+                raise ValueError(
+                    "adaptive_draft_router default_model_id must match one of the "
+                    f"configured model ids. Got {self.default_model_id!r}."
+                )
+
+            # The routed proposer manages its own draft-model registry. Keep the
+            # shared single-model fields aligned with the target config so generic
+            # paths that inspect draft_model_config remain well-defined.
+            self.prompt_lookup_max = 0
+            self.prompt_lookup_min = 0
+            self.draft_model_config = self.target_model_config
+            self.draft_parallel_config = self.target_parallel_config
         elif self.method == "extract_hidden_states":
             from vllm.transformers_utils.configs.extract_hidden_states import (
                 ExtractHiddenStatesConfig,
@@ -877,6 +941,11 @@ class SpeculativeConfig:
             # For draft model-based speculation, we need one new slot per request
             # Since we do not slice the draft tokens
             slots_per_req += 1
+        if self.uses_adaptive_draft_router():
+            # Routed draft models are expected to behave like draft_model-style
+            # speculation from the scheduler's point of view. This upper bound is
+            # intentionally conservative for the scaffold.
+            slots_per_req += 1
         return slots_per_req
 
     def use_eagle(self) -> bool:
@@ -887,6 +956,9 @@ class SpeculativeConfig:
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"
+
+    def uses_adaptive_draft_router(self) -> bool:
+        return self.method == "adaptive_draft_router"
 
     def uses_extract_hidden_states(self) -> bool:
         return self.method == "extract_hidden_states"
